@@ -1,0 +1,28 @@
+# 编译产物
+/relay
+/bin/
+*.exe
+*.out
+
+# Go 相关
+/vendor/
+
+# 环境与密钥（绝不提交）
+.env
+*.local
+secrets/
+
+# 数据库本地数据卷（若 docker-compose 挂了本地目录）
+/pgdata/
+
+# IDE / 编辑器
+.vscode/
+.idea/
+*.swp
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 日志
+*.log
