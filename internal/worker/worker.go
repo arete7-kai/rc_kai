@@ -32,23 +32,26 @@ type Config struct {
 	BaseBackoff  time.Duration // 指数退避基数（base）
 	DialTimeout  time.Duration // 建连超时
 	TotalTimeout time.Duration // 整体请求超时
+	AllowHosts   []string      // SSRF 白名单（仅本地 dev/demo 放行 mock，生产留空）；见 security.NewGuard
 }
 
 // Pool 是投递 worker 池。
 type Pool struct {
 	store  *store.Store
+	guard  *security.Guard
 	client *http.Client
 	cfg    Config
 	log    *slog.Logger
 }
 
-// New 构造 worker 池，内部用 security.NewClient 装配一个 SSRF 安全、带超时的 HTTP 客户端。
+// New 构造 worker 池，内部用 security.Guard 装配一个 SSRF 安全、带超时的 HTTP 客户端。
 func New(st *store.Store, cfg Config, log *slog.Logger) *Pool {
-	client := security.NewClient(security.ClientConfig{
+	guard := security.NewGuard(cfg.AllowHosts)
+	client := guard.NewClient(security.ClientConfig{
 		DialTimeout:  cfg.DialTimeout,
 		TotalTimeout: cfg.TotalTimeout,
 	})
-	return &Pool{store: st, client: client, cfg: cfg, log: log}
+	return &Pool{store: st, guard: guard, client: client, cfg: cfg, log: log}
 }
 
 // Run 启动 worker 池并阻塞，直到 ctx 取消。多个 worker 并发调用 ClaimDue，
@@ -114,8 +117,8 @@ func (p *Pool) deliver(t *store.Notification) {
 
 	// D3: 目标 URL 来自入队时从注册表快照的 t.URL，worker 从不接受调用方任意 URL。
 	// SSRF: 先做预校验（连接时的 IP 校验在 security.NewClient 的 Control 里再做一次，防 DNS rebinding）。
-	if err := security.ValidateTarget(ctx, t.URL); err != nil {
-		p.log.Warn("target rejected", "id", t.ID, "err", err)
+	if err := p.guard.ValidateTarget(ctx, t.URL); err != nil {
+		p.log.Warn("target rejected", "notification_id", t.ID, "err", err)
 		p.markDead(ctx, t, 0, "target rejected: "+err.Error())
 		return
 	}
@@ -132,41 +135,81 @@ func (p *Pool) deliver(t *store.Notification) {
 	}
 
 	// 带超时的 HTTP 调用（超时在 security.NewClient 里设，连接超时 + 整体超时都有）。
-	resp, err := p.client.Do(req)
+	resp, doErr := p.client.Do(req)
+	code := 0
+	if doErr == nil {
+		defer resp.Body.Close()
+		// 读掉少量响应体以便连接复用；业务方不关心返回值，故不解析内容。
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 32<<10))
+		code = resp.StatusCode
+	}
+
+	// 错误分类（README §4.5）。分类逻辑抽成纯函数 classify，便于单测。
+	switch classify(code, doErr) {
+	case outcomeDelivered:
+		if err := p.store.MarkDelivered(ctx, t.ID, code); err != nil {
+			p.log.Error("mark delivered failed", "notification_id", t.ID, "err", err)
+			return
+		}
+		p.log.Info("delivered", "notification_id", t.ID, "destination", t.DestinationID,
+			"attempt", t.Attempts+1, "code", code)
+	case outcomeRetry:
+		p.retryOrDead(ctx, t, code, retryReason(code, doErr))
+	case outcomeDead:
+		p.markDead(ctx, t, code, deadReason(code, doErr))
+	}
+}
+
+// outcome 是错误分类的三种去向：成功 / 可重试 / 进死信。
+type outcome int
+
+const (
+	outcomeDelivered outcome = iota
+	outcomeRetry
+	outcomeDead
+)
+
+// classify 按投递结果判定去向（README §4.5, D4）。纯函数，不触碰状态，便于表驱动单测。
+//   - 传输层错误(err != nil)：SSRF 命中(ErrBlockedIP)不可重试→死信；其余（连接错误/超时）可重试。
+//   - 2xx → 成功；429 或 5xx → 可重试；其余 4xx → 不可重试→死信；1xx/3xx（已禁跟随重定向）视为不可投递→死信。
+func classify(statusCode int, err error) outcome {
 	if err != nil {
 		if errors.Is(err, security.ErrBlockedIP) {
-			// SSRF: 连接时命中内网（DNS rebinding）→ 不可重试，直接死信。
-			p.log.Warn("blocked at dial", "id", t.ID, "err", err)
-			p.markDead(ctx, t, 0, "ssrf blocked: "+err.Error())
-			return
+			return outcomeDead // SSRF: 连接时命中内网，重试无意义
 		}
-		// 连接错误 / 超时 → 可重试（README §4.5）。
-		p.retryOrDead(ctx, t, 0, "transport error: "+err.Error())
-		return
+		return outcomeRetry // 连接错误 / 超时
 	}
-	defer resp.Body.Close()
-	// 读掉少量响应体以便连接复用；业务方不关心返回值，故不解析内容。
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 32<<10))
-
-	code := resp.StatusCode
 	switch {
-	case code >= 200 && code < 300:
-		// 2xx → 成功（README §4.5）。
-		if err := p.store.MarkDelivered(ctx, t.ID, code); err != nil {
-			p.log.Error("mark delivered failed", "id", t.ID, "err", err)
-			return
-		}
-		p.log.Info("delivered", "id", t.ID, "dest", t.DestinationID, "code", code)
-	case code == 429 || (code >= 500 && code <= 599):
-		// 429 / 5xx → 可重试（README §4.5）。
-		p.retryOrDead(ctx, t, code, fmt.Sprintf("upstream status %d", code))
-	case code >= 400 && code < 500:
-		// 其余 4xx → 不可重试，直接死信（README §4.5）。
-		p.markDead(ctx, t, code, fmt.Sprintf("non-retryable status %d", code))
+	case statusCode >= 200 && statusCode < 300:
+		return outcomeDelivered
+	case statusCode == 429 || (statusCode >= 500 && statusCode <= 599):
+		return outcomeRetry // 429 与 5xx：可重试（429 与其它 4xx 相反）
+	case statusCode >= 400 && statusCode < 500:
+		return outcomeDead // 其余 4xx：不可重试
 	default:
-		// 1xx/3xx（已禁止跟随重定向）视为不可投递，进死信等人工排查。
-		p.markDead(ctx, t, code, fmt.Sprintf("unexpected status %d", code))
+		return outcomeDead // 1xx/3xx 非预期
 	}
+}
+
+// retryReason / deadReason 生成写入 last_error 的人类可读原因。
+func retryReason(code int, err error) string {
+	if err != nil {
+		return "transport error: " + err.Error()
+	}
+	return fmt.Sprintf("upstream status %d", code)
+}
+
+func deadReason(code int, err error) string {
+	if err != nil {
+		if errors.Is(err, security.ErrBlockedIP) {
+			return "ssrf blocked: " + err.Error()
+		}
+		return "transport error: " + err.Error()
+	}
+	if code >= 400 && code < 500 {
+		return fmt.Sprintf("non-retryable status %d", code)
+	}
+	return fmt.Sprintf("unexpected status %d", code)
 }
 
 // retryOrDead 对可重试失败做决策：未到上限则退避重排，到上限则进死信（README §4.5, D4）。
@@ -181,21 +224,22 @@ func (p *Pool) retryOrDead(ctx context.Context, t *store.Notification, code int,
 	delay := p.backoff(t.Attempts, time.Duration(t.BackoffCapSecs)*time.Second)
 	next := time.Now().Add(delay)
 	if err := p.store.MarkRetry(ctx, t.ID, next, code, reason); err != nil {
-		p.log.Error("mark retry failed", "id", t.ID, "err", err)
+		p.log.Error("mark retry failed", "notification_id", t.ID, "err", err)
 		return
 	}
-	p.log.Info("scheduled retry", "id", t.ID, "dest", t.DestinationID,
+	p.log.Info("scheduled retry", "notification_id", t.ID, "destination", t.DestinationID,
 		"attempt", nextAttempts, "max", t.MaxAttempts, "in", delay.String(), "reason", reason)
 }
 
 // markDead 把通知打入死信并记原因（D4: 死信是可查询、可重投的结构化记录，不是只写日志）。
 func (p *Pool) markDead(ctx context.Context, t *store.Notification, code int, reason string) {
 	if err := p.store.MarkDead(ctx, t.ID, code, reason); err != nil {
-		p.log.Error("mark dead failed", "id", t.ID, "err", err)
+		p.log.Error("mark dead failed", "notification_id", t.ID, "err", err)
 		return
 	}
 	// D4: 是否告警由注册表的 alert_on_dead 决定；v1 先落到 WARN 日志，真正的告警通道后续接。
-	p.log.Warn("dead-lettered", "id", t.ID, "dest", t.DestinationID, "code", code, "reason", reason)
+	p.log.Warn("dead-lettered", "notification_id", t.ID, "destination", t.DestinationID,
+		"attempt", t.Attempts+1, "code", code, "reason", reason)
 }
 
 // backoff: 指数退避 + 抖动（README §4.5, D4）。min(base*2^attempts, cap) 后叠加抖动，

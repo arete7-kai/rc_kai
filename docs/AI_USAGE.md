@@ -25,6 +25,9 @@
 - [编码阶段·第3步] AI 落地了 internal/api（三端点，纯 net/http 的方法+通配路由）与 cmd/relay/main.go（pgx 装配 + worker 池 + 租约回收循环 + 优雅关闭）；配置全走环境变量、无硬编码密钥。
 - [编码阶段·第3步] AI 主动把入队从“live 回查注册表”改成“入队快照”（url/method/headers/secret_ref + max_attempts/backoff_cap 一并冻结进通知行），保证在途任务行为可预测，与 D3 的 URL 快照同一原则。
 - [编码阶段·第3步] AI 把 GET 状态接口设计成“安全视图”，明确不返回 body / headers / secret_ref，避免密钥/负载经查询接口泄漏。
+- [测试阶段·第4步] AI 把 worker 的错误分类从 deliver 里内联 switch 抽成纯函数 classify，便于表驱动单测（覆盖 2xx/4xx/429/5xx/超时/连接错误，重点验证 429 与其它 4xx 相反）；退避与 IP 黑名单也各配了表驱动测试。
+- [编码阶段·第4步] AI 落地了可控失败的 mock upstream（ok/fail/reject/flaky/timeout，flaky 按 Idempotency-Key 分组计数）+ seed（三个 destination）+ demo 脚本，并实测 mock 五种行为返回码正确。
+- [编码阶段·第4步] AI 把 SSRF 白名单实现成 host 级匹配、连接时也按原始 host 放行（避免 host↔IP 对不上），且只放行“私网/回环检查”这一条，scheme 与 D3 仍照走。
 
 ---
 
@@ -42,6 +45,8 @@
 - [编码阶段·第2步] AI 提议给投递加“可配置的重定向跟随白名单”，被“克制优先”拦下——v1 直接禁跟随 3xx（更安全也更简单），有需要再说。
 - [编码阶段·第3步] AI 一开始让在途 deliver 直接复用 shutdown ctx，会在关闭时立即掐断在途投递；我要求改为“在途用独立 ctx 自然收尾 + 一个 SHUTDOWN_GRACE 总上限兜底”，避免等挂死上游等到天荒地老。
 - [编码阶段·第3步] AI 把单次投递整体超时默认设成 30s，我压到 10s——过长会让慢上游长时间占住 worker（队头阻塞雏形）。
+- [编码阶段·第4步] 面对“SSRF 拦截挡掉本地 mock”这个矛盾，AI 把“一个开关整体关闭 SSRF 检查”也列为可选项；我否了这个方向——安全设计应“默认拒绝 + 显式白名单”，且不该让配置改动去动安全地基本身，最终改为只放行“私网检查”这一条的 host 白名单（SSRF_ALLOW_HOSTS，默认空）。
+- [测试阶段·第4步] AI 想顺手补几条 store/api 的集成测试与 e2e，我按“只测三个纯函数、不追覆盖率、不测集成链路”的要求砍掉——集成靠 demo 脚本肉眼验收即可。
 
 > 对应 docs/DECISIONS.md 的 D1–D5，用自己的话概括"我定了什么、为什么"。
 

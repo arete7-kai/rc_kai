@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -59,6 +60,12 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// SSRF 白名单：仅本地 dev/demo 放行 mock upstream，生产必须留空（见 security.NewGuard）。
+	allowHosts := splitCSV(os.Getenv("SSRF_ALLOW_HOSTS"))
+	if len(allowHosts) > 0 {
+		log.Warn("SSRF allowlist active — dev/demo only, MUST be empty in production", "hosts", allowHosts)
+	}
+
 	pool := worker.New(st, worker.Config{
 		Workers:      workerCount,
 		BatchSize:    getenvInt("WORKER_BATCH_SIZE", 10, log),
@@ -66,6 +73,7 @@ func main() {
 		BaseBackoff:  getenvDuration("WORKER_BASE_BACKOFF", time.Second, log),
 		DialTimeout:  getenvDuration("HTTP_DIAL_TIMEOUT", 5*time.Second, log),
 		TotalTimeout: getenvDuration("HTTP_TOTAL_TIMEOUT", 10*time.Second, log),
+		AllowHosts:   allowHosts,
 	}, log)
 
 	leaseTimeout := getenvDuration("LEASE_TIMEOUT", 60*time.Second, log)
@@ -154,6 +162,21 @@ func reclaimLoop(ctx context.Context, st *store.Store, interval, leaseTimeout ti
 			}
 		}
 	}
+}
+
+// splitCSV 把逗号分隔的环境变量切成去空白、去空项的列表；空串返回 nil。
+func splitCSV(s string) []string {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func getenv(key, def string) string {

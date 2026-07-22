@@ -180,9 +180,11 @@ Worker 领取后若在投递中途崩溃，任务会卡在 `DELIVERING`。用 `l
 一个"替业务方向任意 URL 发请求"的内部服务，本质上是一个**可被利用的 SSRF 代理**——恶意或出错的调用方可能让它去打内网地址（元数据服务、内部管理端口等）。v1 就必须处理：
 
 - **目标白名单 / 供应商注册表**：优先让业务方引用预先登记的 `destination_id`，而非任意 URL；凭证也集中管理，避免密钥散落在每个请求和日志里。
-- **禁止内网目标**：解析目标 IP，拒绝私有网段与回环地址（`10/8`、`172.16/12`、`192.168/16`、`127/8`、`169.254/16` 等）。
+- **禁止内网目标**：解析目标**实际连接的 IP**（而非只看 URL 里的 host 字符串，防 DNS rebinding），拒绝私有网段与回环地址（`10/8`、`172.16/12`、`192.168/16`、`127/8`、`169.254/16`、`::1` 等）。校验点在连接前的 `net.Dialer.Control`，并顺带禁止跟随 3xx 重定向（也是 SSRF 向量）。
 
 这一点 AI 生成的方案里经常缺失，但它是真实生产事故的常见来源，所以放进 v1。
+
+> **`SSRF_ALLOW_HOSTS`（仅 dev/demo）**：因为 demo 的 mock upstream 必然跑在回环/私网地址上，会被上面的拦截挡掉，故提供一个环境变量白名单 `SSRF_ALLOW_HOSTS`（逗号分隔的 host）。它遵循"默认拒绝 + 显式白名单"：**默认空 = 严格拦截**；只有命中的 host 才跳过"私网/回环 IP 检查"这一条，而 **scheme 仅限 http/https、以及"目标必须来自注册表（D3）"两条仍然照走**，白名单不是绕过一切的后门。⚠️ 命中的 host 会跳过内网拦截，**绝不能填入不可信地址**；**生产环境必须留空**。
 
 ---
 
@@ -228,23 +230,52 @@ Worker 领取后若在投递中途崩溃，任务会卡在 `DELIVERING`。用 `l
 
 ---
 
-## 10. 目录结构与运行（规划）
+## 10. 目录结构与运行
 
 ```
-rc_{your_nickname}/
 ├── README.md            # 本设计文档
-├── docs/
-│   └── AI_USAGE.md      # AI 使用说明
-├── cmd/relay/main.go    # 入口
+├── docs/                # DECISIONS / TECH_CHOICES / AI_USAGE
+├── cmd/relay/main.go    # 服务入口（装配 API + worker 池 + 租约回收 + 优雅关闭）
 ├── internal/
 │   ├── api/             # Ingress + 查询/重投接口
-│   ├── store/           # notifications 表与领取逻辑
-│   ├── worker/          # 投递、退避、死信
+│   ├── store/           # notifications 表、SKIP LOCKED 领取、死信、租约回收
+│   ├── worker/          # 投递、退避、错误分类
 │   └── security/        # 目标校验、SSRF 防护
-└── migrations/          # 建表 SQL
+├── migrations/          # 建表 SQL（docker compose 首次起库时自动执行）
+├── mock/                # 可控失败的 mock upstream（demo/测试用）
+├── seed/                # 注册表种子（三个 demo destination）
+├── demo/                # demo 脚本
+└── docker-compose.yml   # 起 Postgres
 ```
 
-启动依赖仅 Postgres；`docker compose up` 起库，`go run ./cmd/relay` 起服务（代码实现见后续提交）。
+### 一步步跑通 demo 全景
+
+启动依赖仅 Postgres。以下命令假定在仓库根目录；Windows 用户在 Git Bash 里跑脚本。
+
+```bash
+# 1) 起 Postgres（migrations/ 挂到 initdb.d，首次起库自动建表）
+docker compose up -d
+
+# 2) seed 注册表：预置 ad-system / crm / inventory 三个 destination
+docker compose exec -T db psql -U relay -d relay < seed/seed.sql
+
+# 3) 起 mock upstream（监听 :9090，用 query 控制成功/失败/flaky）
+go run ./mock &
+
+# 4) 起 relay。SSRF_ALLOW_HOSTS 放行本地 mock（仅 dev/demo，生产留空）；
+#    退避基数调小让 demo 几秒内就能看到重试→成功/死信。
+DATABASE_URL='postgres://relay:relay@localhost:5432/relay?sslmode=disable' \
+SSRF_ALLOW_HOSTS='127.0.0.1' \
+WORKER_BASE_BACKOFF='1s' \
+go run ./cmd/relay &
+
+# 5) 跑 demo：提交一批通知，等几秒，查状态/死信
+bash demo/demo.sh
+```
+
+**预期结果**：`ad-system` → `DELIVERED`（一次成功）；`crm` → `DELIVERED`（flaky，重试约 3 次后成功）；`inventory` → `DEAD`（稳定 500，重试到 `max_attempts` 进死信，可用 `POST /notifications/{id}/retry` 重投）。relay 与 mock 的结构化日志里能看到每次投递尝试 / 重试 / 进死信的全过程。
+
+> 重跑一遍（清空数据重新建表 + seed）：`docker compose down -v && docker compose up -d`，再从第 2 步开始。
 
 ---
 

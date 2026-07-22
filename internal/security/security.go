@@ -5,8 +5,8 @@
 // 目标，也不允许其解析到内网/回环地址。
 //
 // SSRF: 关键在于校验“实际要连接的 IP”，而不是 URL 里的 host 字符串——否则域名可被解析到内网
-// （DNS rebinding）。因此真正的把关放在 NewClient 里 net.Dialer.Control：它在建连前拿到解析
-// 后的具体 IP，逐个校验。ValidateTarget 是一层“早失败”的预校验，不替代连接时校验。
+// （DNS rebinding）。因此真正的把关放在 Guard.NewClient 里 net.Dialer.Control：它在建连前拿到
+// 解析后的具体 IP，逐个校验。ValidateTarget 是一层“早失败”的预校验，不替代连接时校验。
 package security
 
 import (
@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -64,20 +65,49 @@ func isBlockedIP(ip net.IP) bool {
 	return false
 }
 
+// Guard 持有 SSRF 白名单并暴露目标校验与安全 HTTP 客户端的构造。
+type Guard struct {
+	// allow 是“私网/回环放行”白名单（按 URL host 匹配）。
+	allow map[string]bool
+}
+
+// NewGuard 用 SSRF 白名单构造 Guard。allowHosts 为空即严格模式（默认，生产必须如此）。
+//
+// ⚠️ SSRF_ALLOW_HOSTS 的语义与风险（务必读）：
+//   - 它**只**放行“私网/回环网段”这一条检查——scheme(仅 http/https) 与“目标必须来自注册表”
+//     (D3，在 api 层保证) 依然照常执行，白名单不是绕过一切的后门。
+//   - 命中的 host 会跳过内网拦截，因此绝不能填入不可信地址；仅供本地 dev/demo 放行 mock upstream。
+//   - 生产环境必须留空（默认空 = 严格拦截一切私网/回环）。
+func NewGuard(allowHosts []string) *Guard {
+	m := make(map[string]bool, len(allowHosts))
+	for _, h := range allowHosts {
+		if h = strings.TrimSpace(h); h != "" {
+			m[h] = true
+		}
+	}
+	return &Guard{allow: m}
+}
+
 // ValidateTarget 在投递前对目标 URL 做预校验：scheme 合法、host 非空、预解析出的 IP 不在黑名单。
 // 这是一层“早失败 + 清晰原因”的防御；真正防 DNS rebinding 的是 NewClient 里连接时的 IP 校验。
 // SSRF: 命中黑名单时返回包裹 ErrBlockedIP 的错误。
-func ValidateTarget(ctx context.Context, rawURL string) error {
+func (g *Guard) ValidateTarget(ctx context.Context, rawURL string) error {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return fmt.Errorf("security: 目标 URL 无法解析: %w", err)
 	}
+	// scheme 始终校验（白名单不放行这条）。
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return fmt.Errorf("security: 只允许 http/https，收到 %q", u.Scheme)
 	}
 	host := u.Hostname()
 	if host == "" {
 		return fmt.Errorf("security: 目标 URL 缺少 host")
+	}
+
+	// 白名单命中：仅跳过“私网/回环 IP 检查”这一条（scheme 已校验，D3 由 api 层保证）。
+	if g.allow[host] {
+		return nil
 	}
 
 	// host 本身是 IP：直接校验。
@@ -108,30 +138,27 @@ type ClientConfig struct {
 }
 
 // NewClient 构造一个 SSRF 安全、带超时的 *http.Client：
-//   - net.Dialer.Control 在建连前校验解析出的实际 IP（防 DNS rebinding）——真正的 SSRF 把关点；
+//   - 非白名单目标：net.Dialer.Control 在建连前校验解析出的实际 IP（防 DNS rebinding）；
+//   - 白名单目标：跳过私网/回环 IP 检查（仅本地 dev/demo，见 NewGuard 注释）；
 //   - 禁止跟随重定向（3xx 可能把请求引向内网，也是 SSRF 向量）；
 //   - 连接超时 + 整体超时都显式设置（README §4：别用默认无超时）。
-func NewClient(cfg ClientConfig) *http.Client {
-	dialer := &net.Dialer{
-		Timeout: cfg.DialTimeout,
-		// SSRF: Control 在建连前拿到解析后的具体地址，逐个 IP 校验，防住 DNS rebinding。
-		Control: func(network, address string, _ syscall.RawConn) error {
-			host, _, err := net.SplitHostPort(address)
-			if err != nil {
-				return fmt.Errorf("security: 无法解析连接地址 %q: %w", address, err)
-			}
-			ip := net.ParseIP(host)
-			if ip == nil {
-				return fmt.Errorf("security: 连接地址 %q 不是合法 IP", host)
-			}
-			if isBlockedIP(ip) {
-				return fmt.Errorf("security: 拒绝连接内网/回环地址 %s: %w", ip, ErrBlockedIP)
-			}
-			return nil
-		},
+func (g *Guard) NewClient(cfg ClientConfig) *http.Client {
+	// 带内网拦截的拨号器（默认路径）。
+	blocking := &net.Dialer{Timeout: cfg.DialTimeout, Control: controlBlockPrivate}
+	// 不做内网拦截的拨号器（仅白名单 host 走这条）。
+	plain := &net.Dialer{Timeout: cfg.DialTimeout}
+
+	dial := func(ctx context.Context, network, address string) (net.Conn, error) {
+		// address 是 URL 里的原始 host:port（解析前），据此按 host 匹配白名单，
+		// 与 ValidateTarget 的匹配口径一致，避免 host↔IP 对不上。
+		if host, _, err := net.SplitHostPort(address); err == nil && g.allow[host] {
+			return plain.DialContext(ctx, network, address)
+		}
+		return blocking.DialContext(ctx, network, address)
 	}
+
 	transport := &http.Transport{
-		DialContext:         dialer.DialContext,
+		DialContext:         dial,
 		TLSHandshakeTimeout: cfg.DialTimeout,
 	}
 	return &http.Client{
@@ -142,4 +169,20 @@ func NewClient(cfg ClientConfig) *http.Client {
 			return http.ErrUseLastResponse
 		},
 	}
+}
+
+// controlBlockPrivate 在建连前拿到解析后的具体地址，逐个 IP 校验，防住 DNS rebinding（SSRF）。
+func controlBlockPrivate(_, address string, _ syscall.RawConn) error {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return fmt.Errorf("security: 无法解析连接地址 %q: %w", address, err)
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return fmt.Errorf("security: 连接地址 %q 不是合法 IP", host)
+	}
+	if isBlockedIP(ip) {
+		return fmt.Errorf("security: 拒绝连接内网/回环地址 %s: %w", ip, ErrBlockedIP)
+	}
+	return nil
 }
