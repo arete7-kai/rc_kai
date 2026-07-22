@@ -61,24 +61,18 @@
 
 ```mermaid
 flowchart LR
-    BIZ[业务系统] -->|POST /notifications| API[Ingress API]
-    API -->|先落盘 PENDING| DB[(PostgreSQL<br/>notifications 表)]
-    API -->|202 Accepted + id| BIZ
-
-    subgraph SVC[通知中继服务 单进程]
-      API
-      W1[Worker]
-      W2[Worker]
-    end
-
-    W1 -->|SKIP LOCKED 领取到期任务| DB
-    W2 -->|SKIP LOCKED 领取到期任务| DB
-    W1 -->|带超时的 HTTP 调用| EXT[外部供应商 API]
-    W2 --> EXT
-    W1 -->|更新状态/退避/死信| DB
-
-    OPS[运维/排障] -->|GET /notifications/:id| API
-    OPS -->|查看&重投死信| API
+BIZ[业务系统] -->|POST /notifications| API[Ingress API]
+API -->|先落盘 PENDING| DB[(PostgreSQL notifications 表)]
+API -->|202 Accepted + id| BIZ
+subgraph SVC[通知中继服务 单进程]
+API
+W[Worker 池 N 个并发]
+end
+W -->|SKIP LOCKED 领取到期任务| DB
+W -->|带超时的 HTTP 调用| EXT[外部供应商 API]
+W -->|更新状态/退避/死信| DB
+OPS[运维/排障] -->|GET /notifications/:id| API
+OPS -->|查看&重投死信| API
 ```
 
 - **Ingress API**：校验 → 落盘为 `PENDING` → 返回 `202 + id`。
