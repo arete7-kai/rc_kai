@@ -279,7 +279,7 @@ bash demo/demo.sh
 
 ### Windows 用户注意事项
 
-上面的命令按 Linux/macOS 的 shell 写。在 Windows（PowerShell）上实测踩到过四个坑，逐条给出现象与解法：
+上面的命令按 Linux/macOS 的 shell 写。在 Windows（PowerShell）上实测踩到过三个坑，逐条给出现象与解法：
 
 1. **跑 demo 脚本**
    - *现象*：`demo/demo.sh` 是 bash 脚本，直接敲 `bash demo/demo.sh` 时 `bash` 可能被解析成 WSL 的 bash 而失败（未装 WSL 或发行版时报错）。
@@ -296,18 +296,8 @@ bash demo/demo.sh
      docker compose exec db psql -U relay -d relay -f /tmp/seed.sql
      ```
 
-3. **起 relay 时设环境变量**
-   - *现象*：第 4 步那种 `KEY=value \`（命令前缀式）设环境变量是 POSIX shell 语法，PowerShell 不认，会报错或把变量当命令。
-   - *解法*：在 PowerShell 里用 `$env:KEY="value"` 分行设好，再 `go run`：
-     ```powershell
-     $env:DATABASE_URL="postgres://relay:relay@localhost:5432/relay?sslmode=disable"
-     $env:SSRF_ALLOW_HOSTS="127.0.0.1"
-     $env:WORKER_BASE_BACKOFF="1s"
-     go run ./cmd/relay
-     ```
-
-4. **后台运行 mock / relay**
-   - *现象*：第 3、4 步用 `go run ./mock &` 和 `go run ./cmd/relay &` 结尾的 `&` 是 bash 的后台运行语法，PowerShell **不支持**（会报错或行为不符预期）。
+3. **后台运行 mock / relay（以及在此设环境变量）**
+   - *现象*：第 3、4 步用 `go run ./mock &` 和 `go run ./cmd/relay &` 结尾的 `&` 是 bash 的后台运行语法，PowerShell **不支持**（会报错或行为不符预期）；此外第 4 步那种 `KEY=value \`（命令前缀式）设环境变量也是 POSIX 语法，PowerShell 不认。
    - *解法*：开**多个终端**，mock、relay、demo 各占一个终端**前台运行**（都不要加 `&`）。典型顺序：
      - 终端 A（起 mock，前台）：
        ```powershell
