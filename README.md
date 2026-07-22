@@ -274,6 +274,127 @@ bash demo/demo.sh
 ```
 
 **预期结果**：`ad-system` → `DELIVERED`（一次成功）；`crm` → `DELIVERED`（flaky，重试约 3 次后成功）；`inventory` → `DEAD`（稳定 500，重试到 `max_attempts` 进死信，可用 `POST /notifications/{id}/retry` 重投）。relay 与 mock 的结构化日志里能看到每次投递尝试 / 重试 / 进死信的全过程。
+## 实际结果
+
+### 1. 提交一批通知
+
+```text
+ad-system  -> 1f44000b-7ea6-45d6-a4d6-1bf2a0e8c453
+crm        -> b3e20c0f-525e-4c12-a162-561bf5d87a5b
+inventory  -> 88a2e8b3-54f0-44d6-8d5f-405593a8b7bd
+```
+
+### 2. 入口幂等验证
+
+使用同一个 `Idempotency-Key` 重复提交 `ad-system`，应返回相同的通知 ID。
+
+```text
+重复提交 -> 1f44000b-7ea6-45d6-a4d6-1bf2a0e8c453
+```
+
+验证结果：
+
+```text
+OK：ID 相同，未重复入队
+```
+
+### 3. 等待 Worker 投递和退避重试
+
+等待约 10 秒，让 Worker 完成消息投递及退避重试。
+
+### 4. 查询通知状态
+
+#### ad-system
+
+通知 ID：
+
+```text
+1f44000b-7ea6-45d6-a4d6-1bf2a0e8c453
+```
+
+```json
+{
+  "id": "1f44000b-7ea6-45d6-a4d6-1bf2a0e8c453",
+  "destination_id": "ad-system",
+  "status": "DELIVERED",
+  "attempts": 1,
+  "max_attempts": 5,
+  "next_attempt_at": "2026-07-22T17:52:31.05912-04:00",
+  "last_status_code": 200,
+  "created_at": "2026-07-22T17:52:31.05912-04:00",
+  "updated_at": "2026-07-22T17:52:31.287755-04:00"
+}
+```
+
+#### crm
+
+通知 ID：
+
+```text
+b3e20c0f-525e-4c12-a162-561bf5d87a5b
+```
+
+```json
+{
+  "id": "b3e20c0f-525e-4c12-a162-561bf5d87a5b",
+  "destination_id": "crm",
+  "status": "DELIVERED",
+  "attempts": 3,
+  "max_attempts": 10,
+  "next_attempt_at": "2026-07-22T17:52:33.545941-04:00",
+  "last_status_code": 200,
+  "created_at": "2026-07-22T17:52:31.130339-04:00",
+  "updated_at": "2026-07-22T17:52:34.287651-04:00"
+}
+```
+
+#### inventory
+
+通知 ID：
+
+```text
+88a2e8b3-54f0-44d6-8d5f-405593a8b7bd
+```
+
+```json
+{
+  "id": "88a2e8b3-54f0-44d6-8d5f-405593a8b7bd",
+  "destination_id": "inventory",
+  "status": "DEAD",
+  "attempts": 3,
+  "max_attempts": 3,
+  "next_attempt_at": "2026-07-22T17:52:33.402905-04:00",
+  "last_status_code": 500,
+  "last_error": "max attempts (3) reached: upstream status 500",
+  "created_at": "2026-07-22T17:52:31.201031-04:00",
+  "updated_at": "2026-07-22T17:52:34.292567-04:00"
+}
+```
+
+### 预期结果
+
+| Destination | 预期状态        |   实际尝试次数 |
+| ----------- | ----------- | -------: |
+| `ad-system` | `DELIVERED` |        1 |
+| `crm`       | `DELIVERED` |    约 3 次 |
+| `inventory` | `DEAD`      | 达到上限 3 次 |
+
+实际结果符合预期。
+
+### 5. 手动重投死信消息
+
+手动重投 `inventory` 的死信消息。由于上游仍然返回失败，该消息后续会再次重试，并在达到最大重试次数后重新进入死信状态。
+
+重投响应：
+
+```json
+{
+  "id": "88a2e8b3-54f0-44d6-8d5f-405593a8b7bd",
+  "status": "PENDING"
+}
+```
+
+重投后，消息状态恢复为 `PENDING`。随后 Worker 会重新执行投递，并按照重试策略处理，直到投递成功或再次达到最大重试次数。
 
 > 重跑一遍（清空数据重新建表 + seed）：`docker compose down -v && docker compose up -d`，再从第 2 步开始。
 
