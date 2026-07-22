@@ -31,14 +31,18 @@ CREATE TABLE notifications (
     id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),                 -- 主键，也是返回给业务方的追踪 ID（PG13+ 内置 gen_random_uuid）
     idempotency_key  TEXT,                                                       -- D1: 入口幂等键，业务方可选传入；NULL 表示不参与去重
     destination_id   TEXT NOT NULL REFERENCES destinations(id),
-    url              TEXT NOT NULL,                                              -- 下面三列为入队时从 destinations 快照的目标请求描述
+    -- url/method/headers/secret_ref/max_attempts/backoff_cap_secs 均为入队时从 destinations 快照来的值。
+    -- 快照而非 live 回查：可靠性系统里“在途任务行为可预测”优先于“配置即时生效”（与 D3 的 URL 快照同一原则）。
+    url              TEXT NOT NULL,
     method           TEXT NOT NULL,
     headers          JSONB NOT NULL DEFAULT '{}'::jsonb,
+    secret_ref       TEXT,                                                       -- D3: 密钥引用快照（占位，不存明文）
     body             BYTEA NOT NULL,                                             -- 最终 payload，格式不透明（哑管道）
     status           TEXT NOT NULL DEFAULT 'PENDING'
                         CHECK (status IN ('PENDING','DELIVERING','DELIVERED','DEAD')), -- 状态机见 README §4.3
     attempts         INT  NOT NULL DEFAULT 0,                                    -- 已尝试次数（记录结果时 +1）
-    max_attempts     INT  NOT NULL,                                             -- 上限，来自注册表 severity 策略 (D4)
+    max_attempts     INT  NOT NULL,                                             -- 重试上限快照，来自注册表 severity 策略 (D4)
+    backoff_cap_secs INT  NOT NULL,                                             -- 退避上限（秒）快照，来自注册表策略 (D4)
     next_attempt_at  TIMESTAMPTZ NOT NULL DEFAULT now(),                        -- D4: 退避的落地方式——下次可被领取的时间
     locked_at        TIMESTAMPTZ,                                               -- §4.7: 领取租约时间戳，崩溃恢复用
     last_status_code INT,                                                       -- 最近一次 HTTP 状态码（连接错误/超时时为 NULL），排障用

@@ -35,10 +35,12 @@ type Notification struct {
 	URL            string
 	Method         string
 	Headers        []byte // jsonb 原始字节
+	SecretRef      sql.NullString
 	Body           []byte
 	Status         Status
 	Attempts       int
 	MaxAttempts    int
+	BackoffCapSecs int
 	NextAttemptAt  time.Time
 	LockedAt       sql.NullTime
 	LastStatusCode sql.NullInt32
@@ -47,16 +49,19 @@ type Notification struct {
 	UpdatedAt      time.Time
 }
 
-// NewNotification 是入队时由 api 层组装的入参：url/method/headers 已从注册表快照(D3)，
-// body 是调用方最终 payload，max_attempts 来自目标的 severity 策略(D4)。
+// NewNotification 是入队时由 api 层组装的入参。api 先按 destination_id 从注册表取配置，
+// 把 url/method/headers/secret_ref + max_attempts/backoff_cap 一并“快照”进这里(D3/D4)，
+// body 是调用方最终 payload。worker 全程只读这些快照值，不再回查注册表。
 type NewNotification struct {
 	IdempotencyKey string // "" 表示不做入口去重
 	DestinationID  string
 	URL            string
 	Method         string
 	Headers        []byte
+	SecretRef      string // "" 表示无
 	Body           []byte
 	MaxAttempts    int
+	BackoffCapSecs int
 }
 
 // Destination 映射 destinations 注册表的一行。注册表是系统的“策略控制面”：
@@ -87,8 +92,8 @@ func New(db *sql.DB) *Store {
 }
 
 // notifCols 是所有查询共享的列顺序，与 scanNotification 一一对应。
-const notifCols = `id, idempotency_key, destination_id, url, method, headers, body,
-	status, attempts, max_attempts, next_attempt_at, locked_at,
+const notifCols = `id, idempotency_key, destination_id, url, method, headers, secret_ref, body,
+	status, attempts, max_attempts, backoff_cap_secs, next_attempt_at, locked_at,
 	last_status_code, last_error, created_at, updated_at`
 
 // rowScanner 兼容 *sql.Row 与 *sql.Rows。
@@ -100,8 +105,8 @@ func scanNotification(sc rowScanner) (Notification, error) {
 	var n Notification
 	var status string
 	err := sc.Scan(
-		&n.ID, &n.IdempotencyKey, &n.DestinationID, &n.URL, &n.Method, &n.Headers, &n.Body,
-		&status, &n.Attempts, &n.MaxAttempts, &n.NextAttemptAt, &n.LockedAt,
+		&n.ID, &n.IdempotencyKey, &n.DestinationID, &n.URL, &n.Method, &n.Headers, &n.SecretRef, &n.Body,
+		&status, &n.Attempts, &n.MaxAttempts, &n.BackoffCapSecs, &n.NextAttemptAt, &n.LockedAt,
 		&n.LastStatusCode, &n.LastError, &n.CreatedAt, &n.UpdatedAt,
 	)
 	n.Status = Status(status)
@@ -119,22 +124,22 @@ func (s *Store) Enqueue(ctx context.Context, n NewNotification) (id string, exis
 
 	if n.IdempotencyKey == "" {
 		err = s.db.QueryRowContext(ctx, `
-			INSERT INTO notifications (destination_id, url, method, headers, body, max_attempts)
-			VALUES ($1, $2, $3, $4::jsonb, $5, $6)
+			INSERT INTO notifications (destination_id, url, method, headers, secret_ref, body, max_attempts, backoff_cap_secs)
+			VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8)
 			RETURNING id`,
-			n.DestinationID, n.URL, n.Method, string(headers), n.Body, n.MaxAttempts,
+			n.DestinationID, n.URL, n.Method, string(headers), nullString(n.SecretRef), n.Body, n.MaxAttempts, n.BackoffCapSecs,
 		).Scan(&id)
 		return id, false, err
 	}
 
 	// 带幂等键：冲突则不插入，随后取回已存在的 id。
 	err = s.db.QueryRowContext(ctx, `
-		INSERT INTO notifications (idempotency_key, destination_id, url, method, headers, body, max_attempts)
-		VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
+		INSERT INTO notifications (idempotency_key, destination_id, url, method, headers, secret_ref, body, max_attempts, backoff_cap_secs)
+		VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9)
 		ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL
 		DO NOTHING
 		RETURNING id`,
-		n.IdempotencyKey, n.DestinationID, n.URL, n.Method, string(headers), n.Body, n.MaxAttempts,
+		n.IdempotencyKey, n.DestinationID, n.URL, n.Method, string(headers), nullString(n.SecretRef), n.Body, n.MaxAttempts, n.BackoffCapSecs,
 	).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		// 已存在同键记录：取回原 id，视为幂等命中。

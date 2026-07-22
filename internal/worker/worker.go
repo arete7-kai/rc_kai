@@ -20,6 +20,10 @@ import (
 	"rc_kai/internal/store"
 )
 
+// statusWriteGrace 是投递上下文在 HTTP 整体超时之外，为写回投递结果额外预留的余量，
+// 避免 HTTP 恰好用满超时预算后写状态的 ctx 已过期。
+const statusWriteGrace = 5 * time.Second
+
 // Config 是投递引擎的可调参数。
 type Config struct {
 	Workers      int           // worker goroutine 数量
@@ -82,14 +86,17 @@ func (p *Pool) drain(ctx context.Context, id int) {
 		}
 		tasks, err := p.store.ClaimDue(ctx, p.cfg.BatchSize)
 		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return // shutdown 中，正常停止领新活
+			}
 			p.log.Error("claim due failed", "worker", id, "err", err)
 			return
 		}
 		for i := range tasks {
 			if ctx.Err() != nil {
-				return
+				return // shutdown：停止启动新任务；已在途的由 deliver 独立 ctx 自行收尾
 			}
-			p.deliver(ctx, &tasks[i])
+			p.deliver(&tasks[i])
 		}
 		if len(tasks) < p.cfg.BatchSize {
 			return
@@ -98,21 +105,18 @@ func (p *Pool) drain(ctx context.Context, id int) {
 }
 
 // deliver 投递单条通知，并按结果更新状态。
-func (p *Pool) deliver(ctx context.Context, t *store.Notification) {
+//
+// 投递用独立于 shutdown 的上下文：收到关闭信号时在途投递不被立即取消，让它自然收尾；
+// 总收尾上限由 main 的 SHUTDOWN_GRACE 统一兜底，到点仍未完成的靠租约回收(§4.7)重投。
+func (p *Pool) deliver(t *store.Notification) {
+	ctx, cancel := context.WithTimeout(context.Background(), p.cfg.TotalTimeout+statusWriteGrace)
+	defer cancel()
+
 	// D3: 目标 URL 来自入队时从注册表快照的 t.URL，worker 从不接受调用方任意 URL。
 	// SSRF: 先做预校验（连接时的 IP 校验在 security.NewClient 的 Control 里再做一次，防 DNS rebinding）。
 	if err := security.ValidateTarget(ctx, t.URL); err != nil {
 		p.log.Warn("target rejected", "id", t.ID, "err", err)
 		p.markDead(ctx, t, 0, "target rejected: "+err.Error())
-		return
-	}
-
-	// 注册表是策略控制面：max_attempts / backoff_cap 按 destination 取（D4）。
-	dest, err := p.store.GetDestination(ctx, t.DestinationID)
-	if err != nil {
-		// 目标已从注册表移除等：无法投递，进死信。
-		p.log.Warn("destination unavailable", "id", t.ID, "dest", t.DestinationID, "err", err)
-		p.markDead(ctx, t, 0, "destination unavailable: "+err.Error())
 		return
 	}
 
@@ -137,7 +141,7 @@ func (p *Pool) deliver(ctx context.Context, t *store.Notification) {
 			return
 		}
 		// 连接错误 / 超时 → 可重试（README §4.5）。
-		p.retryOrDead(ctx, t, dest, 0, "transport error: "+err.Error())
+		p.retryOrDead(ctx, t, 0, "transport error: "+err.Error())
 		return
 	}
 	defer resp.Body.Close()
@@ -155,7 +159,7 @@ func (p *Pool) deliver(ctx context.Context, t *store.Notification) {
 		p.log.Info("delivered", "id", t.ID, "dest", t.DestinationID, "code", code)
 	case code == 429 || (code >= 500 && code <= 599):
 		// 429 / 5xx → 可重试（README §4.5）。
-		p.retryOrDead(ctx, t, dest, code, fmt.Sprintf("upstream status %d", code))
+		p.retryOrDead(ctx, t, code, fmt.Sprintf("upstream status %d", code))
 	case code >= 400 && code < 500:
 		// 其余 4xx → 不可重试，直接死信（README §4.5）。
 		p.markDead(ctx, t, code, fmt.Sprintf("non-retryable status %d", code))
@@ -166,20 +170,22 @@ func (p *Pool) deliver(ctx context.Context, t *store.Notification) {
 }
 
 // retryOrDead 对可重试失败做决策：未到上限则退避重排，到上限则进死信（README §4.5, D4）。
-func (p *Pool) retryOrDead(ctx context.Context, t *store.Notification, dest *store.Destination, code int, reason string) {
+// 重试上限 / 退避上限均取自 notification 上的“入队快照”（t.MaxAttempts / t.BackoffCapSecs），
+// worker 不再回查注册表——在途任务行为可预测优先于配置即时生效。
+func (p *Pool) retryOrDead(ctx context.Context, t *store.Notification, code int, reason string) {
 	nextAttempts := t.Attempts + 1
-	if nextAttempts >= dest.MaxAttempts {
-		p.markDead(ctx, t, code, fmt.Sprintf("max attempts (%d) reached: %s", dest.MaxAttempts, reason))
+	if nextAttempts >= t.MaxAttempts {
+		p.markDead(ctx, t, code, fmt.Sprintf("max attempts (%d) reached: %s", t.MaxAttempts, reason))
 		return
 	}
-	delay := p.backoff(t.Attempts, time.Duration(dest.BackoffCapSecs)*time.Second)
+	delay := p.backoff(t.Attempts, time.Duration(t.BackoffCapSecs)*time.Second)
 	next := time.Now().Add(delay)
 	if err := p.store.MarkRetry(ctx, t.ID, next, code, reason); err != nil {
 		p.log.Error("mark retry failed", "id", t.ID, "err", err)
 		return
 	}
 	p.log.Info("scheduled retry", "id", t.ID, "dest", t.DestinationID,
-		"attempt", nextAttempts, "max", dest.MaxAttempts, "in", delay.String(), "reason", reason)
+		"attempt", nextAttempts, "max", t.MaxAttempts, "in", delay.String(), "reason", reason)
 }
 
 // markDead 把通知打入死信并记原因（D4: 死信是可查询、可重投的结构化记录，不是只写日志）。
