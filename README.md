@@ -101,6 +101,10 @@ OPS -->|查看&重投死信| API
 | `last_status_code` / `last_error` | 最近一次结果，排障用 |
 | `created_at` / `updated_at` | 时间戳 |
 
+> **如何承接"不同供应商地址、Header、Body 都不同"这条需求**：三种差异分别落在不同的地方，互不耦合。
+> - **地址与 Header 差异 → 注册表**：每个供应商的 `url` / `method` / `headers` 各不相同，这些都按 `destination_id` 收在 `destinations` 注册表里（`headers` 用 JSONB 存任意键值）。业务方提交时只引用 `destination_id`，入队时这几项连同 `secret_ref`、重试策略一并**快照**进 `notifications` 行；投递时 worker 从快照读出，`headers` 由 `applyHeaders` 逐条 `set` 到出站请求上（见 §4.5 与 `internal/worker`）。
+> - **Body 差异 → 业务方 payload**：`body` 由业务方在 `POST /notifications` 时提交，中继**原样透传**给上游——本服务是**哑管道**，不做模板化/字段转换（转换引擎属过度设计，见 §7）。v1 假设 payload 为 JSON、原样存储透传（非 JSON 属已知限制，见 §2.2）。
+
 ### 4.2 API（MVP 三个端点）
 
 - `POST /notifications` —— 提交通知，返回 `202 { id }`。支持 `Idempotency-Key` 请求头。
