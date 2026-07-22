@@ -274,6 +274,38 @@ bash demo/demo.sh
 ```
 
 **预期结果**：`ad-system` → `DELIVERED`（一次成功）；`crm` → `DELIVERED`（flaky，重试约 3 次后成功）；`inventory` → `DEAD`（稳定 500，重试到 `max_attempts` 进死信，可用 `POST /notifications/{id}/retry` 重投）。relay 与 mock 的结构化日志里能看到每次投递尝试 / 重试 / 进死信的全过程。
+
+> **关于重试参数**：DECISIONS D4 里的重试上限（高危 ~10 次）与退避上限（~24h）是**生产建议值**。上面的 demo 为便于几秒内就能观察到"重试→成功 / 重试到上限进死信"，特意用了压缩参数——relay 启动设 `WORKER_BASE_BACKOFF=1s`，seed 把 `inventory` 的 `max_attempts` 调成 3。生产环境应按 destination 的严重等级配置真实值。
+
+### Windows 用户注意事项
+
+上面的命令按 Linux/macOS 的 shell 写。在 Windows（PowerShell）上实测踩到过三个坑，逐条给出现象与解法：
+
+1. **跑 demo 脚本**
+   - *现象*：`demo/demo.sh` 是 bash 脚本，直接敲 `bash demo/demo.sh` 时 `bash` 可能被解析成 WSL 的 bash 而失败（未装 WSL 或发行版时报错）。
+   - *解法*：显式用 Git Bash 跑（第 5 步替换成）：
+     ```powershell
+     & "C:\Program Files\Git\bin\bash.exe" demo/demo.sh
+     ```
+
+2. **灌 seed**
+   - *现象*：第 2 步的 `... < seed/seed.sql` 用了输入重定向，而 PowerShell **不支持 `<`**；若改用 `Get-Content seed/seed.sql | ...`，Get-Content 默认不是 UTF-8，会把 SQL 里的中文注释读成乱码，psql 报 `syntax error`。
+   - *解法*：先把文件拷进容器再在容器内执行（避开重定向和本地编码）：
+     ```powershell
+     docker compose cp seed/seed.sql db:/tmp/seed.sql
+     docker compose exec db psql -U relay -d relay -f /tmp/seed.sql
+     ```
+
+3. **起 relay 时设环境变量**
+   - *现象*：第 4 步那种 `KEY=value \`（命令前缀式）设环境变量是 POSIX shell 语法，PowerShell 不认，会报错或把变量当命令。
+   - *解法*：在 PowerShell 里用 `$env:KEY="value"` 分行设好，再 `go run`：
+     ```powershell
+     $env:DATABASE_URL="postgres://relay:relay@localhost:5432/relay?sslmode=disable"
+     $env:SSRF_ALLOW_HOSTS="127.0.0.1"
+     $env:WORKER_BASE_BACKOFF="1s"
+     go run ./cmd/relay
+     ```
+
 ## 实际结果
 
 ### 1. 提交一批通知
