@@ -4,6 +4,12 @@
 
 **技术栈**：Go（`net/http` + `database/sql`）· PostgreSQL（同时充当持久层与任务队列）· 无外部消息中间件（v1 刻意不引入，理由见 §9）。
 
+> **📖 文档导航**
+> - 设计与实现说明：本 README（问题理解 / 架构 / 核心设计 / 决策取舍 / 演进）
+> - 关键决策记录：[docs/DECISIONS.md](docs/DECISIONS.md)（D1–D6 每条的完整论证）
+> - 技术选型说明：[docs/TECH_CHOICES.md](docs/TECH_CHOICES.md)（为什么选它 / 替代方案）
+> - AI 使用说明：[docs/AI_USAGE.md](docs/AI_USAGE.md)（帮助 / 未采纳建议 / 我的决策）
+
 ---
 
 ## 0. 一句话结论
